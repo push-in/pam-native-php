@@ -1,0 +1,37 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  php:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ['8.4', '8.5']
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ matrix.php }}
+          tools: composer:v2
+          coverage: none
+      - name: Validate package metadata
+        run: composer validate --strict --no-check-lock
+      - name: Preflight the dependency graph
+        run: composer install --dry-run --no-interaction --prefer-dist
+      - name: Install and validate the distributable package
+        run: |
+          composer install --no-interaction --prefer-dist
+          composer dump-autoload --optimize --strict-psr
+          find src bin -type f -name '*.php' -print0 | xargs -0 -n1 php -l
