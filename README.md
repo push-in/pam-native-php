@@ -5,13 +5,13 @@ state and events, Rust performs retained layout and incremental diffing, and
 Kotlin mounts bounded mutation batches on the Android UI thread.
 
 ```bash
-pam add native
+pam composer require pushinbr/pam-native
 ```
 
 For a complete project:
 
 ```bash
-pam init hello-native --template mobile
+pam init hello-native --template native
 cd hello-native
 pam composer install
 pam doctor
@@ -59,6 +59,11 @@ binding, conditional blocks, loops, utility classes and user-defined theme
 tokens. The fluent PHP element API and custom Kotlin views remain available as
 escape hatches, so the template/class convention is optional.
 
+Complex controls can expose localized TalkBack and VoiceOver alternatives to
+gesture-only interaction. Bind up to eight `{name, label}` entries through
+`:accessibilityActions` and handle `on:accessibilityAction`, or use
+`Element::accessibilityActions()` with typed `AccessibilityAction` values.
+
 Safe-area and keyboard avoidance remain native:
 
 ```xml
@@ -97,6 +102,10 @@ PHP.
 `allowFontScaling()`, `maxFontSizeMultiplier()`, `adjustsFontSizeToFit()`,
 `breakStrategy()`, `hyphenation()` and `dataDetector()`. Android performs
 selection, fitting, line breaking and link detection inside `TextView`.
+Font scaling is enabled by default. A maximum multiplier of `0` is unbounded;
+positive caps are normalized to at least `1` so a cap never shrinks text below
+its authored size. Android uses the active configuration scale and iOS uses the
+mounted view's Dynamic Type trait collection.
 
 Android project fonts can be bundled in the application source and loaded
 through an asset family:
@@ -453,6 +462,7 @@ generic request API or the `post()`, `put()`, `patch()` and `delete()` helpers:
 ```php
 use Pam\Native\Http\Http;
 use Pam\Native\Http\HttpResponse;
+use Pam\Native\Http\OutboundTraceContext;
 
 Http::json(
     method: 'POST',
@@ -477,12 +487,25 @@ Http::request(
     ],
     body: json_encode(['name' => $name], JSON_THROW_ON_ERROR),
 );
+
+$trace = new OutboundTraceContext(
+    traceparent: $serverTraceparent,
+    origin: 'https://api.example.com',
+);
+Http::get(
+    'https://api.example.com/orders',
+    fn (HttpResponse $response) => $this->loaded($response),
+    trace: $trace,
+);
 ```
 
 Production builds require HTTPS. Requests support GET, POST, PUT, PATCH and
 DELETE, up to 32 bounded single-line headers, a one MiB request body and timeout
 values from one to 120 seconds. DNS, connectivity and timeout failures reach the
 same callback with status `0`; they never crash the component runtime.
+Distributed context uses a dedicated strict W3C version `00` value bound to one
+exact HTTPS origin. Generic headers cannot set `traceparent` or `tracestate`,
+and both native hosts revalidate the scope before transmitting the request.
 
 ## License
 

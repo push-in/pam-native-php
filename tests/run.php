@@ -5,6 +5,7 @@ declare(strict_types=1);
 use Pam\Native\App;
 use Pam\Native\AppState;
 use Pam\Native\AccessibilityRole;
+use Pam\Native\AccessibilityAction;
 use Pam\Native\AccessibilityCheckedState;
 use Pam\Native\AccessibilityImportance;
 use Pam\Native\AccessibilityLiveRegion;
@@ -80,6 +81,7 @@ use Pam\Native\MotionPreset;
 use Pam\Native\HapticFeedback;
 use Pam\Native\Http\Http;
 use Pam\Native\Http\HttpResponse;
+use Pam\Native\Http\OutboundTraceContext;
 use Pam\Native\Database\SQLite;
 use Pam\Native\NativeOperation;
 use Pam\Native\Forms\FormStatus;
@@ -174,6 +176,8 @@ use Pam\Native\TextEllipsizeMode;
 use Pam\Native\TextHyphenationFrequency;
 use Pam\Native\TextTransform;
 use Pam\Native\Theme;
+use Pam\Native\ThemeMode;
+use Pam\Native\DesignTokens;
 use Pam\Native\UserInterfaceAppearance;
 use Pam\Native\View;
 use Pam\Native\WindowMetrics;
@@ -1636,6 +1640,44 @@ $assert(
     'Accessibility state and range helpers must use fixed protocol properties.',
 );
 
+$accessibilityActionElement = Text::make('Message')
+    ->accessibilityActions(
+        new AccessibilityAction('archive', 'Archive message'),
+        new AccessibilityAction('reply', 'Reply to message'),
+    )
+    ->onAccessibilityAction(static fn (string $name): string => $name);
+$accessibilityActionDefinitions = json_decode(
+    $accessibilityActionElement->properties()[PropKey::AccessibilityActions->value],
+    true,
+    flags: JSON_THROW_ON_ERROR,
+);
+$assert(
+    $accessibilityActionElement->properties()[PropKey::Accessible->value] === true
+        && $accessibilityActionElement
+            ->properties()[PropKey::OnAccessibilityAction->value] === true
+        && $accessibilityActionElement->events()[EventKind::AccessibilityAction->value]('reply')
+            === 'reply'
+        && $accessibilityActionDefinitions === [
+            ['name' => 'archive', 'label' => 'Archive message'],
+            ['name' => 'reply', 'label' => 'Reply to message'],
+        ],
+    'Accessibility actions must stay bounded, typed and connected to event 65.',
+);
+foreach ([
+    static fn () => new AccessibilityAction('Not Safe', 'Label'),
+    static fn () => new AccessibilityAction('safe', ''),
+    static fn () => Text::make('Duplicate')->accessibilityActions(
+        new AccessibilityAction('open', 'Open'),
+        new AccessibilityAction('open', 'Open again'),
+    ),
+] as $invalidAccessibilityAction) {
+    try {
+        $invalidAccessibilityAction();
+        throw new RuntimeException('Invalid accessibility action should fail closed.');
+    } catch (InvalidArgumentException) {
+    }
+}
+
 $safeAreaElement = SafeAreaView::make(Text::make('Inset content'))
     ->edges(top: true, right: false, bottom: true, left: false)
     ->mode(SafeAreaMode::Margin);
@@ -1726,6 +1768,15 @@ $assert(
         && $textElement->properties()[PropKey::TextDataDetectorType->value]
             === TextDataDetectorType::Link->value,
     'Text helpers must preserve selection, fitting, breaking and detector properties.',
+);
+$assert(
+    Text::make('Bounded')
+        ->maxFontSizeMultiplier(0.5)
+        ->properties()[PropKey::TextMaxFontSizeMultiplier->value] === 1.0
+        && Text::make('Unbounded')
+            ->maxFontSizeMultiplier(0.0)
+            ->properties()[PropKey::TextMaxFontSizeMultiplier->value] === 0.0,
+    'Text font scaling must encode zero as unbounded and clamp positive caps to at least one.',
 );
 
 $statusBarElement = StatusBar::make(
@@ -2302,6 +2353,213 @@ $assert($firstFrame === $secondFrame, 'Tree encoding must be deterministic.');
 $assert(str_starts_with($firstFrame, 'PNT1'), 'Tree frame magic is missing.');
 $assert(count($first['callbacks']) === 1, 'Event callback was not registered.');
 
+$invalidTreeTextRejected = false;
+try {
+    (new TreeEncoder())->encode(Text::make("\xc3\x28"));
+} catch (InvalidArgumentException) {
+    $invalidTreeTextRejected = true;
+}
+$assert($invalidTreeTextRejected, 'Tree encoding must reject malformed UTF-8 text.');
+
+$invalidWireTextRejected = false;
+try {
+    Wire::map(['text' => "\xc3\x28"]);
+} catch (InvalidArgumentException) {
+    $invalidWireTextRejected = true;
+}
+$assert($invalidWireTextRejected, 'Wire maps must reject malformed UTF-8 text.');
+
+$invalidPackedListTextRejected = false;
+try {
+    Wire::stringList(["\xc3\x28"]);
+} catch (InvalidArgumentException) {
+    $invalidPackedListTextRejected = true;
+}
+$assert($invalidPackedListTextRejected, 'Packed string lists must reject malformed UTF-8 text.');
+
+$invalidPackedSectionTextRejected = false;
+try {
+    Wire::stringSections(['section' => ["\xc3\x28"]]);
+} catch (InvalidArgumentException) {
+    $invalidPackedSectionTextRejected = true;
+}
+$assert($invalidPackedSectionTextRejected, 'Packed sections must reject malformed UTF-8 text.');
+
+$listBoundaryText = str_repeat('x', Wire::MAX_VALUE_BYTES - 8);
+$assert(
+    strlen(Wire::stringList([$listBoundaryText])) === Wire::MAX_VALUE_BYTES,
+    'Packed string lists must accept the exact one-megabyte boundary.',
+);
+$oversizedStringListRejected = false;
+try {
+    Wire::stringList([$listBoundaryText.'x']);
+} catch (InvalidArgumentException) {
+    $oversizedStringListRejected = true;
+}
+$assert($oversizedStringListRejected, 'Packed string lists must reject one megabyte plus one byte.');
+
+$sectionBoundaryText = str_repeat('x', Wire::MAX_VALUE_BYTES - 17);
+$assert(
+    strlen(Wire::stringSections(['a' => [$sectionBoundaryText]])) === Wire::MAX_VALUE_BYTES,
+    'Packed sections must accept the exact one-megabyte boundary.',
+);
+$oversizedSectionListRejected = false;
+try {
+    Wire::stringSections(['a' => [$sectionBoundaryText.'x']]);
+} catch (InvalidArgumentException) {
+    $oversizedSectionListRejected = true;
+}
+$assert($oversizedSectionListRejected, 'Packed sections must reject one megabyte plus one byte.');
+
+$maximumPackedItems = array_fill(0, Wire::MAX_LIST_ITEMS, '');
+$assert(
+    strlen(Wire::stringList($maximumPackedItems)) === 4 + (Wire::MAX_LIST_ITEMS * 4),
+    'Packed string lists must accept exactly 100,000 items.',
+);
+$tooManyPackedItemsRejected = false;
+try {
+    Wire::stringList([...$maximumPackedItems, '']);
+} catch (InvalidArgumentException) {
+    $tooManyPackedItemsRejected = true;
+}
+$assert($tooManyPackedItemsRejected, 'Packed string lists must reject item 100,001.');
+unset($maximumPackedItems);
+
+$maximumSections = [];
+for ($index = 0; $index < Wire::MAX_SECTIONS; $index++) {
+    $maximumSections["s{$index}"] = [];
+}
+$assert(Wire::stringSections($maximumSections) !== '', 'Packed sections must accept 10,000 sections.');
+$tooManySectionsRejected = false;
+try {
+    Wire::stringSections([...$maximumSections, 'overflow' => []]);
+} catch (InvalidArgumentException) {
+    $tooManySectionsRejected = true;
+}
+$assert($tooManySectionsRejected, 'Packed sections must reject section 10,001.');
+unset($maximumSections);
+
+$maximumSectionItems = array_fill(0, Wire::MAX_SECTION_ENTRIES - 1, '');
+$assert(
+    Wire::stringSections(['section' => $maximumSectionItems]) !== '',
+    'Packed sections must accept exactly 100,000 total entries.',
+);
+$tooManySectionEntriesRejected = false;
+try {
+    Wire::stringSections(['section' => [...$maximumSectionItems, '']]);
+} catch (InvalidArgumentException) {
+    $tooManySectionEntriesRejected = true;
+}
+$assert($tooManySectionEntriesRejected, 'Packed sections must reject total entry 100,001.');
+unset($maximumSectionItems);
+
+$invalidWireDecodeRejected = false;
+try {
+    Wire::decodeMap(
+        pack('v', 1).pack('v', 4).'text'."\x01".pack('V', 2)."\xc3\x28",
+    );
+} catch (InvalidArgumentException) {
+    $invalidWireDecodeRejected = true;
+}
+$assert($invalidWireDecodeRejected, 'Wire map decoding must reject malformed UTF-8 text.');
+
+$invalidWireKeyRejected = false;
+try {
+    Wire::map(['1invalid' => 'value']);
+} catch (InvalidArgumentException) {
+    $invalidWireKeyRejected = true;
+}
+$assert($invalidWireKeyRejected, 'Wire map encoding must reject non-portable keys.');
+
+$invalidWireBooleanRejected = false;
+try {
+    Wire::decodeMap(pack('v', 1).pack('v', 4).'flag'."\x04\x02");
+} catch (InvalidArgumentException) {
+    $invalidWireBooleanRejected = true;
+}
+$assert($invalidWireBooleanRejected, 'Wire map decoding must reject invalid booleans.');
+
+$duplicateWireKeyRejected = false;
+try {
+    Wire::decodeMap(
+        pack('v', 2)
+        .pack('v', 3).'key'."\x04\x00"
+        .pack('v', 3).'key'."\x04\x01",
+    );
+} catch (InvalidArgumentException) {
+    $duplicateWireKeyRejected = true;
+}
+$assert($duplicateWireKeyRejected, 'Wire map decoding must reject duplicate keys.');
+
+$invalidTreeFloatRejected = false;
+try {
+    (new TreeEncoder())->encode(\Pam\Native\UI\Spacer::make(NAN));
+} catch (InvalidArgumentException) {
+    $invalidTreeFloatRejected = true;
+}
+$assert($invalidTreeFloatRejected, 'Tree encoding must reject non-finite floats.');
+
+$invalidWireFloatRejected = false;
+try {
+    Wire::map(['value' => INF]);
+} catch (InvalidArgumentException) {
+    $invalidWireFloatRejected = true;
+}
+$assert($invalidWireFloatRejected, 'Wire map encoding must reject non-finite decimals.');
+
+$invalidWireFloatDecodeRejected = false;
+try {
+    Wire::decodeMap(
+        pack('v', 1).pack('v', 5).'value'."\x03".pack('e', NAN),
+    );
+} catch (InvalidArgumentException) {
+    $invalidWireFloatDecodeRejected = true;
+}
+$assert($invalidWireFloatDecodeRejected, 'Wire map decoding must reject non-finite decimals.');
+
+$canonicalWire = Wire::map([
+    'zeta' => 42,
+    'ratio' => 1.5,
+    'enabled' => true,
+    'alpha' => 'Pam',
+]);
+$assert(
+    $canonicalWire === Wire::map([
+        'alpha' => 'Pam',
+        'enabled' => true,
+        'ratio' => 1.5,
+        'zeta' => 42,
+    ])
+        && bin2hex($canonicalWire)
+            === '04000500616c706861010300000050616d0700656e61626c656404010500726174696f03000000000000f83f04007a657461022a00000000000000',
+    'Wire maps must use the shared canonical key order and golden bytes.',
+);
+
+$wireBoundaryText = str_repeat('x', Wire::MAX_VALUE_BYTES - 10);
+$assert(
+    strlen(Wire::map(['a' => $wireBoundaryText])) === Wire::MAX_VALUE_BYTES,
+    'Wire maps must accept the exact one-megabyte boundary.',
+);
+
+$oversizedWireEncodeRejected = false;
+try {
+    Wire::map(['a' => $wireBoundaryText.'x']);
+} catch (InvalidArgumentException) {
+    $oversizedWireEncodeRejected = true;
+}
+$assert($oversizedWireEncodeRejected, 'Wire map encoding must reject one megabyte plus one byte.');
+
+$oversizedWireDecodeRejected = false;
+try {
+    Wire::decodeMap(
+        pack('v', 1).pack('v', 1).'a'."\x01".pack('V', strlen($wireBoundaryText) + 1)
+        .$wireBoundaryText.'x',
+    );
+} catch (InvalidArgumentException) {
+    $oversizedWireDecodeRejected = true;
+}
+$assert($oversizedWireDecodeRejected, 'Wire map decoding must reject one megabyte plus one byte.');
+
 $nativeContainer = CustomView::make(
     'community.container',
     ['axis' => 1],
@@ -2407,6 +2665,38 @@ $coreRoleElement = TemplateRenderer::render(
     ),
     null,
     [],
+);
+$accessibilityActionScope = new class {
+    /** @var list<array{name: string, label: string}> */
+    public array $actions = [
+        ['name' => 'archive', 'label' => 'Archive message'],
+    ];
+
+    public string $selectedAction = '';
+
+    public function selectAction(string $name): void
+    {
+        $this->selectedAction = $name;
+    }
+};
+$templateAccessibilityActionElement = TemplateRenderer::render(
+    TemplateCompiler::compile(
+        '<Text :accessibilityActions="$actions" on:accessibilityAction="selectAction">Message</Text>',
+    ),
+    $accessibilityActionScope,
+    [],
+);
+$templateAccessibilityActionElement
+    ->events()[EventKind::AccessibilityAction->value]('archive');
+$assert(
+    json_decode(
+        $templateAccessibilityActionElement
+            ->properties()[PropKey::AccessibilityActions->value],
+        true,
+        flags: JSON_THROW_ON_ERROR,
+    ) === [['name' => 'archive', 'label' => 'Archive message']]
+        && $accessibilityActionScope->selectedAction === 'archive',
+    'Templates must preserve typed custom accessibility actions and their event payload.',
 );
 $flexAliasElement = TemplateRenderer::render(
     TemplateCompiler::compile(
@@ -2785,11 +3075,11 @@ $wire = Wire::map([
     'ratio' => 1.5,
     'enabled' => true,
 ]);
-$assert(Wire::decodeMap($wire) === [
-    'name' => 'Pam',
+$assert(Wire::decodeMap($wire) == [
     'count' => 42,
-    'ratio' => 1.5,
     'enabled' => true,
+    'name' => 'Pam',
+    'ratio' => 1.5,
 ], 'Wire map round-trip failed.');
 
 $counter = new class extends Component {
@@ -2823,7 +3113,7 @@ $assert(
     TestDiagnostics::$moduleCall !== null
         && TestDiagnostics::$moduleCall['requestId'] === $requestId
         && TestDiagnostics::$moduleCall['module'] === 'community.echo'
-        && Wire::decodeMap(TestDiagnostics::$moduleCall['payload']) === ['message' => 'fast'],
+        && Wire::decodeMap(TestDiagnostics::$moduleCall['payload']) == ['message' => 'fast'],
     'Public native module facade did not emit a typed bridge call.',
 );
 Runtime::dispatchModuleResult(
@@ -3140,7 +3430,7 @@ $assert(
         && $copyAssetCall['requestId'] === $copyAssetRequest
         && $copyAssetCall['module'] === 'files'
         && $copyAssetCall['method'] === 'copyAsset'
-        && Wire::decodeMap($copyAssetCall['payload']) === [
+        && Wire::decodeMap($copyAssetCall['payload']) == [
             'assetPath' => 'assets/templates/story.webp',
             'path' => 'drafts/story.webp',
         ],
@@ -3185,7 +3475,7 @@ $assert(
         && $downloadCall['requestId'] === $downloadRequest
         && $downloadCall['module'] === 'files'
         && $downloadCall['method'] === 'download'
-        && Wire::decodeMap($downloadCall['payload']) === [
+        && Wire::decodeMap($downloadCall['payload']) == [
             'url' => 'https://cdn.example.test/media/story.webp',
             'path' => 'drafts/remote-story.webp',
             'maximumBytes' => 8_388_608,
@@ -3255,7 +3545,7 @@ Runtime::dispatchModuleResult(
 $downloadNextRequest = TestDiagnostics::$moduleCall['requestId'] ?? 0;
 $assert(
     (TestDiagnostics::$moduleCall['method'] ?? '') === 'downloadNext'
-        && Wire::decodeMap(TestDiagnostics::$moduleCall['payload'] ?? '') === ['subscription' => 77],
+        && Wire::decodeMap(TestDiagnostics::$moduleCall['payload'] ?? '') == ['subscription' => 77],
     'Progress downloads must consume the native observation channel.',
 );
 Runtime::dispatchModuleResult(
@@ -3299,7 +3589,7 @@ $openRequest = Files::open(
 );
 $assert(
     (TestDiagnostics::$moduleCall['method'] ?? '') === 'open'
-        && Wire::decodeMap(TestDiagnostics::$moduleCall['payload'] ?? '') === [
+        && Wire::decodeMap(TestDiagnostics::$moduleCall['payload'] ?? '') == [
             'path' => 'documents/report.pdf',
             'mimeType' => 'application/pdf',
         ],
@@ -3321,7 +3611,7 @@ $assert(
         && $importUriCall['requestId'] === $importUriRequest
         && $importUriCall['module'] === 'files'
         && $importUriCall['method'] === 'importUri'
-        && Wire::decodeMap($importUriCall['payload']) === [
+        && Wire::decodeMap($importUriCall['payload']) == [
             'uri' => 'content://media/external/images/media/42',
         ],
     'Files importUri must emit a typed content URI import.',
@@ -3445,7 +3735,7 @@ $assert(
         && $contactsCall['requestId'] === $contactsRequestId
         && $contactsCall['module'] === 'contacts'
         && $contactsCall['method'] === 'list'
-        && Wire::decodeMap($contactsCall['payload']) === ['offset' => 0, 'limit' => 250],
+        && Wire::decodeMap($contactsCall['payload']) == ['offset' => 0, 'limit' => 250],
     'Contacts facade did not request the first bounded native page.',
 );
 Runtime::dispatchModuleResult(
@@ -3480,7 +3770,7 @@ $assert(
         && $mediaCall['requestId'] === $mediaRequestId
         && $mediaCall['module'] === 'media-library'
         && $mediaCall['method'] === 'assets'
-        && Wire::decodeMap($mediaCall['payload']) === [
+        && Wire::decodeMap($mediaCall['payload']) == [
             'albumId' => 'camera',
             'limit' => 80,
             'offset' => 160,
@@ -3536,7 +3826,7 @@ $assert(
         && $albumCall['requestId'] === $albumRequestId
         && $albumCall['module'] === 'media-library'
         && $albumCall['method'] === 'albums'
-        && Wire::decodeMap($albumCall['payload']) === [
+        && Wire::decodeMap($albumCall['payload']) == [
             'type' => MediaPickerType::Image->value,
         ],
     'MediaLibrary albums must emit its typed media filter.',
@@ -3597,7 +3887,7 @@ $assert(
         && $smsComposeCall['requestId'] === $smsComposeRequest
         && $smsComposeCall['module'] === 'sms'
         && $smsComposeCall['method'] === 'compose'
-        && Wire::decodeMap($smsComposeCall['payload']) === [
+        && Wire::decodeMap($smsComposeCall['payload']) == [
             'recipients' => '+55 11 99999-0000',
             'body' => 'Convite do Zé Chat',
         ],
@@ -3710,7 +4000,7 @@ $assert(
     $cacheClearCall !== null
         && $cacheClearCall['module'] === 'cache'
         && $cacheClearCall['method'] === 'clear'
-        && Wire::decodeMap($cacheClearCall['payload']) === ['preserveOffline' => true],
+        && Wire::decodeMap($cacheClearCall['payload']) == ['preserveOffline' => true],
     'Caches clear must preserve pinned offline media by default.',
 );
 Runtime::dispatchModuleResult(
@@ -3783,6 +4073,61 @@ $assert(
         && $httpResponse->body === '{"token":"access-token"}',
     'Generic HTTP request did not decode its response.',
 );
+
+$traceparent = '00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01';
+$trace = new OutboundTraceContext($traceparent, 'https://api.example.test/');
+Http::get('https://api.example.test/orders', static function (HttpResponse $response): void {}, $trace);
+$tracedPayload = Wire::decodeMap(TestDiagnostics::$moduleCall['payload'] ?? '');
+$assert(
+    ($tracedPayload['traceparent'] ?? null) === $traceparent
+        && ($tracedPayload['traceOrigin'] ?? null) === 'https://api.example.test',
+    'HTTP trace propagation must use a dedicated origin-scoped payload.',
+);
+
+foreach (
+    [
+        static fn () => new OutboundTraceContext('forged', 'https://api.example.test'),
+        static fn () => new OutboundTraceContext($traceparent, 'http://api.example.test'),
+        static fn () => new OutboundTraceContext($traceparent, 'https://user@api.example.test'),
+        static fn () => new OutboundTraceContext($traceparent, 'https://api.example.test/path'),
+    ] as $invalidTraceContext
+) {
+    try {
+        $invalidTraceContext();
+        throw new RuntimeException('Invalid outbound trace context was accepted.');
+    } catch (InvalidArgumentException $error) {
+        $assert(
+            $error->getMessage() !== 'Invalid outbound trace context was accepted.',
+            'Outbound trace validation did not fail closed.',
+        );
+    }
+}
+
+foreach (
+    [
+        static fn () => Http::get(
+            'https://attacker.example.test/orders',
+            static function (HttpResponse $response): void {},
+            $trace,
+        ),
+        static fn () => Http::request(
+            'GET',
+            'https://api.example.test/orders',
+            static function (HttpResponse $response): void {},
+            ['TraceParent' => $traceparent],
+        ),
+    ] as $unsafeTraceRequest
+) {
+    try {
+        $unsafeTraceRequest();
+        throw new RuntimeException('Unsafe HTTP trace propagation was accepted.');
+    } catch (RuntimeException $error) {
+        $assert(
+            $error->getMessage() !== 'Unsafe HTTP trace propagation was accepted.',
+            'HTTP trace context escaped its declared origin or generic-header boundary.',
+        );
+    }
+}
 
 $transportFailure = null;
 $transportFailureId = Http::get(
@@ -4037,6 +4382,46 @@ App::component('Panel', 'panel');
 $assert(
     TemplateRegistry::classProperties('card') !== null,
     'Theme class tokens were not registered.',
+);
+$assert(
+    DesignTokens::TouchTarget === 48.0
+        && DesignTokens::MotionFastMs >= 150
+        && DesignTokens::MotionStandardMs <= 300,
+    'Design tokens must preserve accessible touch targets and responsive motion.',
+);
+foreach (ThemeMode::cases() as $themeMode) {
+    App::theme(Theme::adaptive($themeMode));
+    $buttonTokens = TemplateRegistry::classProperties('button-primary');
+    $surfaceTokens = TemplateRegistry::classProperties('surface');
+    $surfaceMutedTokens = TemplateRegistry::classProperties('surface-muted');
+    $metricTokens = TemplateRegistry::classProperties('metric');
+    $focusTokens = TemplateRegistry::classProperties('focus-ring');
+    $assert(
+        ($buttonTokens[PropKey::MinHeight->value] ?? null) === DesignTokens::TouchTarget
+            && isset($buttonTokens[PropKey::BackgroundColor->value])
+            && isset($buttonTokens[PropKey::TextColor->value]),
+        "Adaptive theme {$themeMode->name} must expose semantic accessible button tokens.",
+    );
+    $assert(
+        Theme::contrastRatio(
+            $metricTokens[PropKey::TextColor->value],
+            $surfaceTokens[PropKey::BackgroundColor->value],
+        ) >= 4.5
+            && Theme::contrastRatio(
+                $focusTokens[PropKey::BorderColor->value],
+                $surfaceTokens[PropKey::BackgroundColor->value],
+            ) >= 3.0
+            && Theme::contrastRatio(
+                $focusTokens[PropKey::BorderColor->value],
+                $surfaceMutedTokens[PropKey::BackgroundColor->value],
+            ) >= 3.0,
+        "Adaptive theme {$themeMode->name} must preserve text and focus contrast.",
+    );
+}
+$assert(
+    Theme::contrastRatio(0xFF0F172A, 0xFFF8FAFC) >= 4.5
+        && Theme::contrastRatio(0xFF4ADE80, 0xFF052E16) >= 4.5,
+    'Theme contrast validation must enforce WCAG AA semantic pairs.',
 );
 
 $template = new class extends Component {
@@ -5538,6 +5923,9 @@ $assert(
     $navigationTimeline !== []
         && $navigationTimeline[0]['kind'] === NavigationTraceKind::Action->value
         && ($navigationDevTools->tree()['routes'][0]['name'] ?? null) === 'home'
+        && ($navigationExport['schemaVersion'] ?? null) === 1
+        && ($navigationExport['surfaceCode'] ?? null) === 2
+        && is_int($navigationExport['capturedAtUnixMs'] ?? null)
         && ($navigationExport['version'] ?? null) === 2
         && ($navigationExport['metrics']['events'] ?? 0) === count($navigationTimeline)
         && ($navigationMetrics['currentRoute'] ?? null) === 'article',
@@ -5827,8 +6215,8 @@ $assert(
     'Grouped drawer state must restore selection and expanded sections.',
 );
 $assert(
-    \Pam\Native\Protocol::SDK_VERSION === '0.6.73',
-    'The runtime SDK contract must match the 0.6.73 package release.',
+    \Pam\Native\Protocol::SDK_VERSION === '0.6.77',
+    'The runtime SDK contract must match the 0.6.77 package release.',
 );
 $imageEditorParameters = (new ReflectionMethod(
     \Pam\Native\System\ImageEditor::class,
